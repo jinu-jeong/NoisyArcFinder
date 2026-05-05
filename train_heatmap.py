@@ -60,8 +60,6 @@ class BulbHeatmapDataset(Dataset):
         self.transform = transforms.Compose(tfms)
 
         self.yy, self.xx = np.mgrid[:IN_H, :IN_W].astype(np.float32)
-        self.sx = IN_W / ORIG_W
-        self.sy = IN_H / ORIG_H
 
     def __len__(self):
         return len(self.records)
@@ -73,20 +71,27 @@ class BulbHeatmapDataset(Dataset):
 
         # 1-channel heatmap: max-composite of all 3 primary Gaussian peaks
         # Ghosts are NOT in the target — the model must learn to ignore them
+        # Use actual image dimensions (may vary per image)
+        orig_w = rec.get("img_w", ORIG_W)
+        orig_h = rec.get("img_h", ORIG_H)
+        sx = IN_W / orig_w
+        sy = IN_H / orig_h
+
         heatmap = np.zeros((IN_H, IN_W), dtype=np.float32)
         sorted_pts = sorted(
             [(c["x"], c["y"]) for c in rec["centroids"]],
             key=lambda p: p[0],
         )
         for gx, gy in sorted_pts:
-            cx = gx * self.sx
-            cy = gy * self.sy
+            cx = gx * sx
+            cy = gy * sy
             d2 = (self.xx - cx) ** 2 + (self.yy - cy) ** 2
             heatmap = np.maximum(heatmap, np.exp(-d2 / (2 * HEATMAP_SIGMA ** 2)))
         heatmap_t = torch.from_numpy(heatmap).unsqueeze(0)  # (1, H, W)
 
-        coords = torch.tensor(sorted_pts, dtype=torch.float32)  # (3, 2)
-        return img, heatmap_t, coords
+        coords = torch.tensor(sorted_pts, dtype=torch.float32)   # (3, 2) in original px
+        orig_wh = torch.tensor([orig_w, orig_h], dtype=torch.float32)  # for decode scaling
+        return img, heatmap_t, coords, orig_wh
 
 
 # ── UNet ───────────────────────────────────────────────────
@@ -176,10 +181,13 @@ def decode_heatmap(hm, k=3, suppress_r=SUPPRESS_R):
     return refined  # (B, k, 2) at output resolution
 
 
-def to_orig_coords(coords_out):
+def to_orig_coords(coords_out, orig_wh):
+    """Scale (B, k, 2) from output resolution back to each image's original size.
+    orig_wh: (B, 2) tensor of [orig_w, orig_h] per sample.
+    """
     out = coords_out.clone()
-    out[..., 0] *= ORIG_W / IN_W
-    out[..., 1] *= ORIG_H / IN_H
+    out[..., 0] *= orig_wh[:, 0:1] / IN_W   # x  (B,1) broadcast over k
+    out[..., 1] *= orig_wh[:, 1:2] / IN_H   # y
     return out
 
 
@@ -212,6 +220,16 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     criterion = nn.MSELoss()
 
+    # Load existing checkpoint as initial weights if available
+    if os.path.isfile(CKPT):
+        try:
+            model.load_state_dict(torch.load(CKPT, map_location=DEVICE))
+            print(f"Resumed from checkpoint: {CKPT}")
+        except Exception as e:
+            print(f"Could not load checkpoint ({e}), starting from scratch.")
+    else:
+        print("No checkpoint found, starting from scratch.")
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Device: {DEVICE}  |  train={len(train_ds)}  test={len(test_ds)}  "
           f"|  params={n_params/1e6:.2f}M\n")
@@ -220,7 +238,7 @@ if __name__ == "__main__":
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_loss = 0.0
-        for imgs, hm_target, _ in train_loader:
+        for imgs, hm_target, _, __ in train_loader:
             imgs      = imgs.to(DEVICE)
             hm_target = hm_target.to(DEVICE)
             preds     = model(imgs)
@@ -234,14 +252,14 @@ if __name__ == "__main__":
         model.eval()
         val_loss = val_err = 0.0
         with torch.no_grad():
-            for imgs, hm_target, coords_orig in test_loader:
+            for imgs, hm_target, coords_orig, orig_wh in test_loader:
                 imgs      = imgs.to(DEVICE)
                 hm_target = hm_target.to(DEVICE)
                 preds     = model(imgs)
                 val_loss += criterion(preds, hm_target).item() * len(imgs)
 
                 pts_out  = decode_heatmap(preds)
-                pts_orig = sort_by_x(to_orig_coords(pts_out))
+                pts_orig = sort_by_x(to_orig_coords(pts_out, orig_wh))
                 val_err += mean_pixel_error(pts_orig, coords_orig) * len(imgs)
         val_loss /= len(test_ds)
         val_err  /= len(test_ds)
