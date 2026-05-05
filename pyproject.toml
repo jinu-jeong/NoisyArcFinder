@@ -1,0 +1,30 @@
+[project]
+name = "bulb-detection"
+version = "0.1.0"
+description = "3 bulb centroid detection through glass (SAM + Grounding DINO + DINOv2)"
+requires-python = ">=3.10,<3.12"
+dependencies = []
+
+[tool.pixi.project]
+channels = ["conda-forge", "pytorch"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+numpy = "*"
+opencv = "*"
+pytorch = "*"
+torchvision = "*"
+matplotlib = "*"
+pillow = "*"
+tqdm = "*"
+requests = "*"
+pip = "*"
+
+[tool.pixi.pypi-dependencies]
+transformers = "*"
+accelerate = "*"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
