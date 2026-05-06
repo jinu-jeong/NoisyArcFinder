@@ -22,8 +22,9 @@ Generation rules:
                      other bulb's group. Rejection sampling enforces this.
 
 Output:
-  synthetic_data/train/  (N_TRAIN images + ground_truth.json)
-  synthetic_data/test/   (N_TEST images  + ground_truth.json)
+  synthetic_data/train/  (N_TRAIN images + ground_truth.json)  — 70 %
+  synthetic_data/val/    (N_VAL   images + ground_truth.json)  — 10 %
+  synthetic_data/test/   (N_TEST  images + ground_truth.json)  — 20 %
 """
 
 import cv2
@@ -35,10 +36,12 @@ from multiprocessing import Pool
 import os as _os
 
 # ── Configuration ─────────────────────────────────────────
-N_TRAIN    = 800
-N_TEST     = 200
+N_TRAIN    = 1400   # 70 % of 2000
+N_VAL      = 200    # 10 % of 2000
+N_TEST     = 400    # 20 % of 2000
 BASE_DIR   = "synthetic_data"
 TRAIN_DIR  = os.path.join(BASE_DIR, "train")
+VAL_DIR    = os.path.join(BASE_DIR, "val")
 TEST_DIR   = os.path.join(BASE_DIR, "test")
 SEED       = 42
 
@@ -58,6 +61,7 @@ MAX_PLACEMENT_TRIES = 500         # rejection-sampling budget per image
 #   ghost shift   ≈  1.6 – 3.9 % of img_w (x),  1.0 – 3.1 % of img_h (y)
 
 os.makedirs(TRAIN_DIR, exist_ok=True)
+os.makedirs(VAL_DIR,   exist_ok=True)
 os.makedirs(TEST_DIR,  exist_ok=True)
 
 
@@ -278,7 +282,12 @@ if __name__ == "__main__":
     n_workers = max(1, _os.cpu_count() or 1)
     print(f"Using {n_workers} worker(s)\n")
 
-    for split, n, out_dir in [("train", N_TRAIN, TRAIN_DIR), ("test", N_TEST, TEST_DIR)]:
+    splits = [
+        ("train", N_TRAIN, TRAIN_DIR),
+        ("val",   N_VAL,   VAL_DIR),
+        ("test",  N_TEST,  TEST_DIR),
+    ]
+    for split, n, out_dir in splits:
         print(f"[{split}] generating {n} images → {out_dir}/")
         args = [(idx, out_dir) for idx in range(n)]
 
@@ -300,4 +309,4 @@ if __name__ == "__main__":
             json.dump(metadata, f, indent=2)
         print(f"  GT saved: {gt_path}\n")
 
-    print(f"Done! train={N_TRAIN} images / test={N_TEST} images")
+    print(f"Done! train={N_TRAIN} / val={N_VAL} / test={N_TEST} images")

@@ -29,6 +29,7 @@ from train_heatmap import (
 OUT_DIR = "prediction_result"
 SPLITS  = [
     ("train", "synthetic_data/train",  os.path.join(OUT_DIR, "train")),
+    ("val",   "synthetic_data/val",    os.path.join(OUT_DIR, "val")),
     ("test",  "synthetic_data/test",   os.path.join(OUT_DIR, "test")),
 ]
 

@@ -4,7 +4,7 @@ train_heatmap.py
 Single-file heatmap-regression trainer for 3-bulb centroid detection.
 
 Pipeline:
-  - Load synthetic_data/{train,test} + ground_truth.json
+  - Load synthetic_data/{train,val,test} + ground_truth.json
   - Resize images to 256×192 (preserves 4:3 aspect of original 640×480)
   - Build a 1-channel target heatmap with 3 Gaussian peaks at GT primaries
     (ghosts are deliberately NOT in the target — model learns to ignore them)
@@ -13,8 +13,11 @@ Pipeline:
       find global max → suppress disk of radius SUPPRESS_R → repeat ×3
       + 3×3 sub-pixel weighted centroid → sort by x to match GT order
     This avoids the max-pool-equality NMS plateau bug.
-  - Report mean per-centroid pixel error in original 640×480 coords
+  - Best checkpoint saved based on val set pixel error (val is NOT test).
+  - Test set is evaluated only once at the end using the best checkpoint.
   - Save best checkpoint to checkpoints/heatmap_best.pt
+
+Split:  train 70 % / val 10 % / test 20 %  (2000 images total)
 """
 
 import json
@@ -208,9 +211,12 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(CKPT), exist_ok=True)
 
     train_ds = BulbHeatmapDataset("synthetic_data/train", augment=True)
+    val_ds   = BulbHeatmapDataset("synthetic_data/val",   augment=False)
     test_ds  = BulbHeatmapDataset("synthetic_data/test",  augment=False)
     pin = DEVICE == "cuda"
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=2, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=pin)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=pin)
@@ -231,8 +237,8 @@ if __name__ == "__main__":
         print("No checkpoint found, starting from scratch.")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Device: {DEVICE}  |  train={len(train_ds)}  test={len(test_ds)}  "
-          f"|  params={n_params/1e6:.2f}M\n")
+    print(f"Device: {DEVICE}  |  train={len(train_ds)}  val={len(val_ds)}  "
+          f"test={len(test_ds)}  |  params={n_params/1e6:.2f}M\n")
 
     best_err = float("inf")
     for epoch in range(1, EPOCHS + 1):
@@ -252,7 +258,7 @@ if __name__ == "__main__":
         model.eval()
         val_loss = val_err = 0.0
         with torch.no_grad():
-            for imgs, hm_target, coords_orig, orig_wh in test_loader:
+            for imgs, hm_target, coords_orig, orig_wh in val_loader:
                 imgs      = imgs.to(DEVICE)
                 hm_target = hm_target.to(DEVICE)
                 preds     = model(imgs)
@@ -261,8 +267,8 @@ if __name__ == "__main__":
                 pts_out  = decode_heatmap(preds)
                 pts_orig = sort_by_x(to_orig_coords(pts_out, orig_wh))
                 val_err += mean_pixel_error(pts_orig, coords_orig) * len(imgs)
-        val_loss /= len(test_ds)
-        val_err  /= len(test_ds)
+        val_loss /= len(val_ds)
+        val_err  /= len(val_ds)
 
         scheduler.step()
         marker = ""
@@ -275,4 +281,21 @@ if __name__ == "__main__":
               f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  "
               f"val_px_err={val_err:.2f}px{marker}")
 
-    print(f"\nDone. Best val pixel error: {best_err:.2f}px  →  {CKPT}")
+    # ── Final evaluation on held-out test set (best checkpoint) ──
+    print(f"\nBest val pixel error: {best_err:.2f}px  →  loading {CKPT} for test eval")
+    model.load_state_dict(torch.load(CKPT, map_location=DEVICE))
+    model.eval()
+    test_loss = test_err = 0.0
+    with torch.no_grad():
+        for imgs, hm_target, coords_orig, orig_wh in test_loader:
+            imgs      = imgs.to(DEVICE)
+            hm_target = hm_target.to(DEVICE)
+            preds     = model(imgs)
+            test_loss += criterion(preds, hm_target).item() * len(imgs)
+
+            pts_out  = decode_heatmap(preds)
+            pts_orig = sort_by_x(to_orig_coords(pts_out, orig_wh))
+            test_err += mean_pixel_error(pts_orig, coords_orig) * len(imgs)
+    test_loss /= len(test_ds)
+    test_err  /= len(test_ds)
+    print(f"Test  — loss={test_loss:.6f}  px_err={test_err:.2f}px")
