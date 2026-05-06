@@ -36,7 +36,7 @@ from multiprocessing import Pool
 import os as _os
 
 # ── Configuration ─────────────────────────────────────────
-N = 10000
+N = 5000
 N_TRAIN = int(N * 0.7)
 N_VAL   = int(N * 0.1)
 N_TEST  = N - N_TRAIN - N_VAL
@@ -58,7 +58,7 @@ MAX_PLACEMENT_TRIES = 500         # rejection-sampling budget per image
 # All spatial parameters are derived proportionally inside generate_one:
 #   margin        ≈ 12.5 % of img_w
 #   zone_inner    ≈  1.6 % of img_w
-#   bulb radius   ≈  3 – 6 % of img_w
+#   bulb radius   ≈  0.8 – 6 % of img_w  (≥ 5 px)
 #   min_group_dist≈ 17   % of img_w
 #   ghost shift   ≈  1.6 – 3.9 % of img_w (x),  1.0 – 3.1 % of img_h (y)
 
@@ -182,7 +182,7 @@ def generate_one(idx, output_dir):
     zone_w         = (img_w - 2 * margin) // 3
     min_group_dist = int(img_w * 0.17)
 
-    r_min = max(4, int(img_w * 0.030))
+    r_min = max(5, int(img_w * 0.008))
     r_max = max(r_min + 1, int(img_w * 0.060))
 
     radii       = [random.randint(r_min, r_max) for _ in range(3)]
