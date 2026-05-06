@@ -36,9 +36,11 @@ from multiprocessing import Pool
 import os as _os
 
 # ── Configuration ─────────────────────────────────────────
-N_TRAIN    = 1400   # 70 % of 2000
-N_VAL      = 200    # 10 % of 2000
-N_TEST     = 400    # 20 % of 2000
+N = 10000
+N_TRAIN = int(N * 0.7)
+N_VAL   = int(N * 0.1)
+N_TEST  = N - N_TRAIN - N_VAL
+
 BASE_DIR   = "synthetic_data"
 TRAIN_DIR  = os.path.join(BASE_DIR, "train")
 VAL_DIR    = os.path.join(BASE_DIR, "val")
