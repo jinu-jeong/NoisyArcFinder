@@ -5,10 +5,13 @@ generate_bulbs.py
 
 Generation rules:
   - bulb(primary)  : bright and sharp gaussian light source (light blur applied).
-                     A bulb is either a full circle, or a linearly-cut "moon" shape
-                     (random angle, cut depth ≤ half — at least half of the disk remains).
-                     Centroid GT is always the center of the underlying full circle,
-                     so the model can fit the visible arc and recover the center.
+                     A bulb is either a full circle, or a linearly-cut "moon"
+                     shape with random angle and cut depth. The cut can extend
+                     past the centre (crescent), so the centroid GT — always
+                     the centre of the underlying full circle — may land in
+                     the cut-away dark region. The model must fit the visible
+                     arc to recover the implicit centre even when it is off
+                     the bright pixels.
   - ghosts         : per image, the number of ghost reflections is uniformly chosen
                      from {0, 1, 2} and applied identically to all 3 bulbs (flat glass
                      assumption). Ghosts are COLLINEAR with the primary: a single
@@ -47,18 +50,46 @@ VAL_DIR    = os.path.join(BASE_DIR, "val")
 TEST_DIR   = os.path.join(BASE_DIR, "test")
 SEED       = 42
 
-# Per-image random resolution
-W_MIN, W_MAX   = 1000, 4500   # image width range (px)
-AR_MIN, AR_MAX = 0.4,  0.6    # height/width aspect ratio range
+# Per-image resolution: base 3840×2158, scaled by a Gaussian multiplier
+IMG_BASE_W      = 3840          # base image width  (px)
+IMG_BASE_H      = 2158          # base image height (px)
+IMG_SCALE_MU    = 1.0           # Gaussian mean for the scale multiplier
+IMG_SCALE_SIGMA = 0.15          # Gaussian std  for the scale multiplier
+IMG_SCALE_MIN   = 0.5           # hard clamp – never smaller than 50 % of base
+IMG_SCALE_MAX   = 1.5           # hard clamp – never larger  than 150 % of base
+
+# Per-bulb radius: base 20 px, scaled by a Gaussian multiplier
+BULB_BASE_R     = 20            # base bulb radius (px)
+BULB_SCALE_MU   = 1.0           # Gaussian mean for the radius multiplier
+BULB_SCALE_SIGMA = 0.2          # Gaussian std  for the radius multiplier
+BULB_SCALE_MIN  = 0.25          # hard clamp – minimum radius = 5 px
+BULB_SCALE_MAX  = 2.0           # hard clamp – maximum radius = 40 px
 
 MOON_PROB           = 0.4   # per-bulb probability of being a linearly-cut "moon" shape
 N_GHOSTS_CHOICES    = [0, 1, 2]   # per-image, sampled uniformly
 MAX_PLACEMENT_TRIES = 500         # rejection-sampling budget per image
 
+# Diffraction spikes
+# 'length' is the Gaussian σ along the spike axis (px); visual half-extent ≈ 3σ.
+# Max 10 × diameter total = 20r → 3σ ≤ 10r → σ_max = 3.3r  → LEN_MAX = 3.3.
+# Amplitude must stay below the glow at the disk edge (≈ 0.5 × intensity),
+# so AMP_MAX is capped at 0.25 to keep spikes visually dimmer than the bulb.
+SPIKE_PROB          = 0.8         # probability that a bulb has diffraction spikes
+SPIKE_N_PAIRS       = [5, 6, 7, 8, 9, 10]  # 5–10 pairs → 10–20 spokes total
+SPIKE_LEN_MU        = 2.0         # Gaussian mean  for spike σ (× radius)
+SPIKE_LEN_SIGMA     = 0.5         # Gaussian std   for spike σ (× radius)
+SPIKE_LEN_MIN       = 0.8         # minimum σ multiplier
+SPIKE_LEN_MAX       = 3.3         # maximum σ multiplier → visual half-extent ≤ 10r = 5 diameters
+SPIKE_WIDTH_FRAC    = 0.15        # perpendicular σ as a fraction of radius (min 0.8 px)
+SPIKE_AMP_MU        = 0.30        # Gaussian mean  for spike peak amplitude (× intensity)
+SPIKE_AMP_SIGMA     = 0.08        # Gaussian std   for spike peak amplitude
+SPIKE_AMP_MIN       = 0.12        # minimum amplitude fraction
+SPIKE_AMP_MAX       = 0.50        # maximum amplitude fraction (max() composition keeps spike < core peak)
+
 # All spatial parameters are derived proportionally inside generate_one:
 #   margin        ≈ 12.5 % of img_w
 #   zone_inner    ≈  1.6 % of img_w
-#   bulb radius   ≈  0.8 – 6 % of img_w  (≥ 5 px)
+#   bulb radius   ≈  base 20 px × Gaussian(1.0, 0.2), clamped to [5, 40] px
 #   min_group_dist≈ 17   % of img_w
 #   ghost shift   ≈  1.6 – 3.9 % of img_w (x),  1.0 – 3.1 % of img_h (y)
 
@@ -68,47 +99,99 @@ os.makedirs(TEST_DIR,  exist_ok=True)
 
 
 # ── Helper: draw a single gaussian light source ───────────
-def draw_bulb(canvas, cx, cy, radius, intensity, blur_sigma, cut=None, grid=None):
-    """Add a bulb to canvas (float32 H×W×3).
+def draw_bulb(canvas, cx, cy, radius, intensity, blur_sigma, cut=None, spikes=None):
+    """Add a bulb to canvas (float32 H×W×3) using a tight bounding box.
 
-    Physical model:
-      1. The bulb's base emitter shape is built first — a filled disk, optionally
-         cut by a straight line (moon shape). The cut happens BEFORE any light
-         scattering, so it represents the bulb's physical shape.
-      2. Light scattering is then modeled by convolving the emitter shape with a
-         gaussian PSF (sigma = radius / 2.5), producing the glow.
-      3. A small extra camera blur (blur_sigma) is applied on top.
+    All array operations are performed on a small local patch rather than the
+    full image.  The patch is pasted back via in-place addition, keeping the
+    memory and compute cost proportional to the bulb/spike size, not the image.
 
-    cut:  None for a full circle, or (angle, offset). Pixels with
-          (X-cx)·cos(angle) + (Y-cy)·sin(angle) > offset are removed from the
-          emitter. offset ∈ [0, radius] keeps ≥ half the disk.
-    grid: optional pre-built (Y, X) ogrid tuple to avoid reallocation per bulb.
+    cut:    None for a full circle, or (angle, offset). Pixels with
+            (X-cx)·cos(angle) + (Y-cy)·sin(angle) > offset are removed from the
+            emitter. offset ∈ [0, radius] keeps ≥ half the disk.
+    spikes: None, or dict with keys
+              n_pairs    – number of spike pairs (2 → 4 spikes, 3 → 6 spikes)
+              base_angle – rotation of the first pair (radians)
+              lengths    – per-pair Gaussian σ along the spike axis (list, px);
+                           visual extent of pair i ≈ ±3 × lengths[i]
+              width_sigma– perpendicular Gaussian σ (pixels)
+              amplitude  – peak value (already scaled by intensity)
     """
     h, w = canvas.shape[:2]
-    if grid is None:
-        Y, X = np.ogrid[:h, :w]
-    else:
-        Y, X = grid
-    dist2 = (X - cx) ** 2 + (Y - cy) ** 2
 
-    # 1) Base emitter shape (cut applied to the BULB itself, before scattering)
+    # ── Bounding box ──────────────────────────────────────────────────────────
+    psf_sigma = radius / 2.5
+    glow_pad  = int(np.ceil(radius + 3 * (psf_sigma + blur_sigma))) + 2
+
+    # Axis-aligned bounding box of every spike ellipse (3σ extent each axis)
+    spike_pad_x = spike_pad_y = 0
+    if spikes is not None:
+        W3 = 3 * spikes["width_sigma"]
+        for i in range(spikes["n_pairs"]):
+            theta = spikes["base_angle"] + i * (np.pi / spikes["n_pairs"])
+            L3    = 3 * spikes["lengths"][i]
+            ca, sa = abs(np.cos(theta)), abs(np.sin(theta))
+            spike_pad_x = max(spike_pad_x, int(np.ceil(ca * L3 + sa * W3)))
+            spike_pad_y = max(spike_pad_y, int(np.ceil(sa * L3 + ca * W3)))
+
+    pad_x = max(glow_pad, spike_pad_x)
+    pad_y = max(glow_pad, spike_pad_y)
+
+    cx_i, cy_i = int(round(cx)), int(round(cy))
+    x0 = max(0, cx_i - pad_x);  x1 = min(w, cx_i + pad_x + 1)
+    y0 = max(0, cy_i - pad_y);  y1 = min(h, cy_i + pad_y + 1)
+    if x1 <= x0 or y1 <= y0:
+        return canvas
+
+    # ── Local coordinate arrays (image-absolute, so cx/cy math stays correct) ─
+    lX = np.arange(x0, x1, dtype=np.float32)[np.newaxis, :]   # (1, lw)
+    lY = np.arange(y0, y1, dtype=np.float32)[:, np.newaxis]   # (lh, 1)
+    dx    = lX - cx
+    dy    = lY - cy
+    dist2 = dx ** 2 + dy ** 2
+
+    # 1) Base emitter shape (cut applied before scattering)
     shape_mask = (dist2 <= radius * radius).astype(np.float32)
     if cut is not None:
         angle, offset = cut
-        proj = (X - cx) * np.cos(angle) + (Y - cy) * np.sin(angle)
-        shape_mask = shape_mask * (proj <= offset).astype(np.float32)
+        proj = dx * np.cos(angle) + dy * np.sin(angle)
+        shape_mask *= (proj <= offset).astype(np.float32)
 
     # 2) Light scattering: emitter convolved with gaussian PSF
-    psf_sigma = radius / 2.5
     k_psf = max(3, int(psf_sigma) * 2 + 1) | 1
-    glow = cv2.GaussianBlur(shape_mask * intensity, (k_psf, k_psf), psf_sigma)
+    glow  = cv2.GaussianBlur(shape_mask * intensity, (k_psf, k_psf), psf_sigma)
 
     # 3) Extra small camera blur
     k_blur = max(3, int(blur_sigma) * 2 + 1) | 1
-    glow = cv2.GaussianBlur(glow, (k_blur, k_blur), blur_sigma)
+    glow   = cv2.GaussianBlur(glow, (k_blur, k_blur), blur_sigma)
 
-    for c in range(3):
-        canvas[:, :, c] += glow
+    # 4) Diffraction spikes – rotated 2-D Gaussians, one per spoke direction.
+    # Compose with max(), not +: the spike is the same emitted light redirected
+    # by diffraction, so it must never make a pixel brighter than the glow peak.
+    if spikes is not None:
+        lengths = spikes["lengths"]
+        w_sigma = spikes["width_sigma"]
+        amp     = spikes["amplitude"]
+        # No interior suppression: the spike runs continuously through the bulb
+        # so a cut (moon) bulb still shows a connected spike line. The glow
+        # always dominates the spike inside an intact disk because
+        # SPIKE_AMP_MAX < glow_peak, so np.maximum keeps the core brightest.
+        spike_layer = np.zeros_like(glow)
+        for i in range(spikes["n_pairs"]):
+            theta = spikes["base_angle"] + i * (np.pi / spikes["n_pairs"])
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            u =  dx * cos_t + dy * sin_t
+            v = -dx * sin_t + dy * cos_t
+            spike = (amp
+                     * np.exp(-0.5 * (u / lengths[i]) ** 2)
+                     * np.exp(-0.5 * (v / w_sigma) ** 2))
+            np.maximum(spike_layer, spike, out=spike_layer)
+        glow = np.maximum(glow, spike_layer)
+
+    # ── Paste local patch back into canvas ────────────────────────────────────
+    canvas[y0:y1, x0:x1, 0] += glow
+    canvas[y0:y1, x0:x1, 1] += glow
+    canvas[y0:y1, x0:x1, 2] += glow
     return canvas
 
 
@@ -172,9 +255,11 @@ def groups_well_separated(xs, ys, ghosts, min_dist):
 
 # ── Generate a single image ───────────────────────────────
 def generate_one(idx, output_dir):
-    # ── Random image dimensions ────────────────────────────
-    img_w = random.randint(W_MIN, W_MAX)
-    img_h = int(img_w * random.uniform(AR_MIN, AR_MAX))
+    # ── Image dimensions: base 3840×2158 × Gaussian multiplier ───
+    img_scale = np.clip(random.gauss(IMG_SCALE_MU, IMG_SCALE_SIGMA),
+                        IMG_SCALE_MIN, IMG_SCALE_MAX)
+    img_w = max(64, int(IMG_BASE_W * img_scale))
+    img_h = max(64, int(IMG_BASE_H * img_scale))
 
     # ── Proportional spatial parameters ───────────────────
     margin         = int(img_w * 0.125)
@@ -182,20 +267,46 @@ def generate_one(idx, output_dir):
     zone_w         = (img_w - 2 * margin) // 3
     min_group_dist = int(img_w * 0.17)
 
-    r_min = max(5, int(img_w * 0.008))
-    r_max = max(r_min + 1, int(img_w * 0.060))
-
-    radii       = [random.randint(r_min, r_max) for _ in range(3)]
+    # ── Bulb radii: base 20 px × per-bulb Gaussian multiplier ────
+    radii = []
+    for _ in range(3):
+        scale = np.clip(random.gauss(BULB_SCALE_MU, BULB_SCALE_SIGMA),
+                        BULB_SCALE_MIN, BULB_SCALE_MAX)
+        radii.append(max(5, int(BULB_BASE_R * scale)))
     intensity   = random.uniform(0.3, 1.0)          # same peak brightness for all 3 bulbs
     intensities = [intensity] * 3
     pri_blurs   = [random.uniform(0.02, 0.06) * r for r in radii]  # scales with radius
 
-    # Per-bulb shape: full circle, or linearly-cut moon (≤ half cut).
+    # Per-bulb diffraction spikes; each spike pair gets its own random length
+    spike_configs = []
+    for r in radii:
+        if random.random() < SPIKE_PROB:
+            n_pairs  = random.choice(SPIKE_N_PAIRS)
+            lengths  = [
+                r * np.clip(random.gauss(SPIKE_LEN_MU, SPIKE_LEN_SIGMA),
+                            SPIKE_LEN_MIN, SPIKE_LEN_MAX)
+                for _ in range(n_pairs)
+            ]
+            amp_frac = np.clip(random.gauss(SPIKE_AMP_MU, SPIKE_AMP_SIGMA),
+                               SPIKE_AMP_MIN, SPIKE_AMP_MAX)
+            spike_configs.append({
+                "n_pairs":     n_pairs,
+                "base_angle":  random.uniform(0, np.pi),
+                "lengths":     lengths,
+                "width_sigma": max(0.5, r * SPIKE_WIDTH_FRAC),
+                "amplitude":   intensity * amp_frac,
+            })
+        else:
+            spike_configs.append(None)
+
+    # Per-bulb shape: full circle, or linearly-cut moon. The cut can extend
+    # past the disk centre (negative offset → crescent), in which case the
+    # centroid GT sits in the cut-away dark region rather than on the arc.
     cuts = []
     for r in radii:
         if random.random() < MOON_PROB:
             angle  = random.uniform(0, 2 * np.pi)
-            offset = random.uniform(0.0, 0.7) * r
+            offset = random.uniform(-0.5, 0.7) * r
             cuts.append((angle, offset))
         else:
             cuts.append(None)
@@ -219,22 +330,18 @@ def generate_one(idx, output_dir):
     if xs is None:
         xs, ys = cand_xs, cand_ys  # fallback (extremely unlikely)
 
-    grid = np.ogrid[:img_h, :img_w]   # build once, reuse for every bulb
-    primary_layer = np.zeros((img_h, img_w), dtype=np.float32)
-    for cx, cy, r, intens, pb, cut in zip(xs, ys, radii, intensities, pri_blurs, cuts):
-        tmp = np.zeros((img_h, img_w, 3), dtype=np.float32)
-        tmp = draw_bulb(tmp, cx, cy, r, intens, pb, cut=cut, grid=grid)
-        primary_layer += tmp[:, :, 0]
+    primary_canvas = np.zeros((img_h, img_w, 3), dtype=np.float32)
+    for cx, cy, r, intens, pb, cut, spk in zip(
+            xs, ys, radii, intensities, pri_blurs, cuts, spike_configs):
+        draw_bulb(primary_canvas, cx, cy, r, intens, pb, cut=cut, spikes=spk)
 
-    primary_rgb = np.stack([primary_layer] * 3, axis=-1)
-
-    ghost_rgb_total = np.zeros_like(primary_rgb)
+    ghost_rgb_total = np.zeros((img_h, img_w, 3), dtype=np.float32)
     for g in ghosts:
         ghost_rgb_total += make_ghost_layer(
-            primary_rgb, g["shift_x"], g["shift_y"], g["blur"], g["alpha"],
+            primary_canvas, g["shift_x"], g["shift_y"], g["blur"], g["alpha"],
         )
 
-    canvas = np.clip(primary_rgb + ghost_rgb_total +
+    canvas = np.clip(primary_canvas + ghost_rgb_total +
                      np.random.normal(0, 0.015, (img_h, img_w, 3)).astype(np.float32),
                      0, 1)
     img_u8 = (canvas * 255).astype(np.uint8)
