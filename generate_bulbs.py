@@ -13,13 +13,22 @@ Generation rules:
                      arc to recover the implicit centre even when it is off
                      the bright pixels.
   - ghosts         : per image, the number of ghost reflections is uniformly chosen
-                     from {0, 1, 2} and applied identically to all 3 bulbs (flat glass
-                     assumption). Ghosts are COLLINEAR with the primary: a single
-                     base shift vector (sx, sy) is sampled per image, and ghost_k is
-                     placed at primary + k · (sx, sy) for k = 1, …, n_ghosts. Each
-                     ghost has its own blur and alpha (per-reflection attenuation),
-                     but the displacement direction is shared. Ghost inherits each
-                     bulb's shape.
+                     from {0, 1, 2}. Each of the 3 bulb-complexes gets its OWN
+                     base shift vector (sx, sy) drawn from [0, MAX] in each axis
+                     with an independent random sign — so within one image, the
+                     left bulb's ghost separation can be small while the middle
+                     bulb's is large (or vice versa, or anything in between).
+                     Ghost_k of bulb b is placed at primary_b + k · (sx_b, sy_b).
+                     Each ghost is a SCALED-DOWN copy of the primary's full shape
+                     (cut mask, diffraction spikes, glow), redrawn at smaller
+                     radius so the star pattern is preserved while the apparent
+                     size shrinks with order. Per-image multiplicative steps make
+                     sizes and brightnesses descend monotonically (k=2 smaller
+                     and fainter than k=1) — sometimes mildly, sometimes
+                     drastically — while a shared base scattering σ keeps every
+                     ghost's diffuseness similar across the 3 bulbs. Ghosts are
+                     comparable in brightness to the primary (alpha_1 ∈ 0.85–0.97)
+                     but always strictly fainter and smaller.
   - separation     : bulbs are placed so that every bulb's group (primary + its ghosts)
                      stays at least MIN_GROUP_DIST pixels away from any point of any
                      other bulb's group. Rejection sampling enforces this.
@@ -66,7 +75,7 @@ BULB_SCALE_MIN  = 0.25          # hard clamp – minimum radius = 5 px
 BULB_SCALE_MAX  = 2.0           # hard clamp – maximum radius = 40 px
 
 MOON_PROB           = 0.4   # per-bulb probability of being a linearly-cut "moon" shape
-N_GHOSTS_CHOICES    = [0, 1, 2]   # per-image, sampled uniformly
+N_GHOSTS_CHOICES    = [2]         # always 2 ghosts per image
 MAX_PLACEMENT_TRIES = 500         # rejection-sampling budget per image
 
 # Diffraction spikes
@@ -74,7 +83,7 @@ MAX_PLACEMENT_TRIES = 500         # rejection-sampling budget per image
 # Max 10 × diameter total = 20r → 3σ ≤ 10r → σ_max = 3.3r  → LEN_MAX = 3.3.
 # Amplitude must stay below the glow at the disk edge (≈ 0.5 × intensity),
 # so AMP_MAX is capped at 0.25 to keep spikes visually dimmer than the bulb.
-SPIKE_PROB          = 0.8         # probability that a bulb has diffraction spikes
+SPIKE_PROB          = 0.0         # probability that a bulb has diffraction spikes (0 = disabled)
 SPIKE_N_PAIRS       = [5, 6, 7, 8, 9, 10]  # 5–10 pairs → 10–20 spokes total
 SPIKE_LEN_MU        = 2.0         # Gaussian mean  for spike σ (× radius)
 SPIKE_LEN_SIGMA     = 0.5         # Gaussian std   for spike σ (× radius)
@@ -195,12 +204,48 @@ def draw_bulb(canvas, cx, cy, radius, intensity, blur_sigma, cut=None, spikes=No
     return canvas
 
 
-# ── Helper: create ghost layer ────────────────────────────
-def make_ghost_layer(primary_layer, shift_x, shift_y, blur_sigma, alpha):
-    """Shift + blur + attenuate the primary layer and return ghost"""
-    h, w = primary_layer.shape[:2]
+# ── Helper: scale per-bulb draw params for a ghost order ──
+def _scale_bulb_params(radii, pri_blurs, cuts, spike_configs, size_scale):
+    """Return (radii, pri_blurs, cuts, spikes) with all spatial sizes shrunk
+    by `size_scale`.  Spike *direction*/*count* are preserved, only their
+    length and width are scaled — this keeps the diffraction/scattering
+    pattern identical across primary and every ghost order, so a viewer
+    sees the same star but smaller.
+    """
+    radii_g = [max(2, int(round(r * size_scale))) for r in radii]
+    blurs_g = [pb * size_scale for pb in pri_blurs]
+    cuts_g  = [None if c is None else (c[0], c[1] * size_scale) for c in cuts]
+    spikes_g = []
+    for spk in spike_configs:
+        if spk is None:
+            spikes_g.append(None)
+            continue
+        spikes_g.append({
+            "n_pairs":     spk["n_pairs"],         # same star pattern
+            "base_angle":  spk["base_angle"],      # same orientation
+            "lengths":     [L * size_scale for L in spk["lengths"]],
+            "width_sigma": max(0.5, spk["width_sigma"] * size_scale),
+            "amplitude":   spk["amplitude"],       # alpha controls overall fade
+        })
+    return radii_g, blurs_g, cuts_g, spikes_g
+
+
+# ── Helper: render a ghost layer for ONE bulb (scaled → shift → blur → α) ─
+def render_single_ghost_layer(canvas_h, canvas_w,
+                              cx, cy, radius, intensity, pri_blur, cut, spike_config,
+                              size_scale, shift_x, shift_y, blur_sigma, alpha):
+    """Draw a single scaled-down copy of one bulb at (cx, cy), translate by
+    (shift_x, shift_y), Gaussian-blur with `blur_sigma`, then attenuate by
+    `alpha`.  Each (bulb, ghost-order) pair is rendered independently so each
+    bulb-complex can have its own primary→ghost shift."""
+    rs, pbs, cs, sps = _scale_bulb_params(
+        [radius], [pri_blur], [cut], [spike_config], size_scale,
+    )
+    layer = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+    draw_bulb(layer, cx, cy, rs[0], intensity, pbs[0], cut=cs[0], spikes=sps[0])
+
     M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-    shifted = cv2.warpAffine(primary_layer, M, (w, h),
+    shifted = cv2.warpAffine(layer, M, (canvas_w, canvas_h),
                              flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT,
                              borderValue=0)
@@ -209,39 +254,86 @@ def make_ghost_layer(primary_layer, shift_x, shift_y, blur_sigma, alpha):
     return blurred * alpha
 
 
-# ── Helpers: ghost params + position sampling ─────────────
-def sample_collinear_ghosts(n_ghosts, img_w, img_h):
-    """Sample n_ghosts ghosts that are collinear with the primary.
+# Per-bulb ghost shifts are capped in ABSOLUTE pixels (not as a fraction of
+# image size) so the maximum primary→2nd-ghost distance is bounded regardless
+# of img_w / img_h.  At 80 px per axis, the 2nd ghost is at most 2·80 = 160 px
+# in each axis from its primary, fitting comfortably inside CROP_SIZE = 500.
+GHOST_MAX_SHIFT_PX = 80    # |base_sx|, |base_sy| ∈ [0, GHOST_MAX_SHIFT_PX]
 
-    All displacements and blur values are proportional to the image dimensions
-    so that the ghost geometry looks consistent regardless of resolution.
-    Returns [] when n_ghosts=0.
+
+# ── Helpers: ghost params + position sampling ─────────────
+def sample_collinear_ghosts(n_ghosts, img_w, img_h, radii):
+    """Sample n_ghosts collinear ghosts for each of the 3 bulbs.
+
+    Returns a list of length 3 (one entry per bulb). Each entry is a list of
+    n_ghosts ghost dicts ordered by reflection order k = 1 … n_ghosts.
+
+    Per-bulb (independent across the 3 bulbs in one image):
+      • shift  : each bulb gets its own (sx, sy) drawn uniformly from the
+                 closed range [0, MAX] in each axis, with an independent
+                 random sign.  Because the lower bound is 0, two of three
+                 bulb-complexes can be tightly stacked while the third is
+                 widely separated (or anything in between).
+                 ghost_k of bulb b is at primary_b + k · (sx_b, sy_b).
+
+    Per-image (shared across the 3 bulbs to keep "scattering pattern similar"):
+      • size schedule  : size_1 ∈ [0.55, 0.85], size_step ∈ [0.45, 0.95].
+                         Every ghost is strictly smaller than the primary and
+                         each subsequent order is smaller still.
+      • alpha schedule : alpha_1 ∈ [0.85, 0.97], alpha_step ∈ [0.70, 0.92].
+                         Comparable to primary, but always darker.
+      • blur character : σ_g/radius ∈ [0.20, 0.45] shared across the image,
+                         multiplied by each ghost's own size_scale so a small
+                         ghost stays proportionally sharp.
     """
     if n_ghosts == 0:
-        return []
-    base_sx = random.uniform(img_w * 0.016, img_w * 0.039) * random.choice([-1, 1])
-    base_sy = random.uniform(img_h * 0.010, img_h * 0.031) * random.choice([-1, 1])
-    blur_scale = img_w / 640.0   # keep blur visually consistent vs. 640 px reference
-    ghosts = []
-    for k in range(1, n_ghosts + 1):
-        ghosts.append({
-            "shift_x": k * base_sx,
-            "shift_y": k * base_sy,
-            "blur":    random.uniform(3, 8) * blur_scale,
-            "alpha":   random.uniform(0.25, 0.55) / k,
-        })
-    return ghosts
+        return [[] for _ in range(3)]
+
+    mean_r          = float(sum(radii)) / len(radii)
+    base_blur_ratio = random.uniform(0.20, 0.45)     # σ_g / radius
+    base_blur       = base_blur_ratio * mean_r       # absolute σ at primary size
+    blur_jitter     = 0.10 * base_blur
+
+    alpha_1    = random.uniform(0.85, 0.97)
+    alpha_step = random.uniform(0.70, 0.92)
+
+    size_1     = random.uniform(0.55, 0.85)
+    size_step  = random.uniform(0.45, 0.95)
+
+    ghosts_per_bulb = []
+    for _b in range(3):
+        # Per-bulb-complex shift — minimum 0 so a ghost can sit on top of
+        # its primary, max ≈ current upper bound.  Sign is independent per
+        # axis and per bulb.
+        sx_b = random.uniform(0, GHOST_MAX_SHIFT_PX) * random.choice([-1, 1])
+        sy_b = random.uniform(0, GHOST_MAX_SHIFT_PX) * random.choice([-1, 1])
+
+        bulb_ghosts = []
+        for k in range(1, n_ghosts + 1):
+            size  = size_1  * (size_step  ** (k - 1))
+            alpha = alpha_1 * (alpha_step ** (k - 1))
+            blur  = max(0.5,
+                        base_blur * size + random.uniform(-blur_jitter, blur_jitter))
+            bulb_ghosts.append({
+                "shift_x": k * sx_b,
+                "shift_y": k * sy_b,
+                "blur":    blur,
+                "alpha":   alpha,
+                "size":    size,
+            })
+        ghosts_per_bulb.append(bulb_ghosts)
+    return ghosts_per_bulb
 
 
-def groups_well_separated(xs, ys, ghosts, min_dist):
-    """Each bulb's group = {primary} ∪ {primary + each ghost shift}.
+def groups_well_separated(xs, ys, ghosts_per_bulb, min_dist):
+    """Each bulb's group = {primary} ∪ {primary + each of *its own* ghost shifts}.
     Require every cross-group pair of points to be ≥ min_dist apart.
     """
     md2 = min_dist * min_dist
     groups = []
-    for cx, cy in zip(xs, ys):
+    for cx, cy, bulb_ghosts in zip(xs, ys, ghosts_per_bulb):
         pts = [(cx, cy)]
-        for g in ghosts:
+        for g in bulb_ghosts:
             pts.append((cx + g["shift_x"], cy + g["shift_y"]))
         groups.append(pts)
     for i in range(len(groups)):
@@ -311,9 +403,11 @@ def generate_one(idx, output_dir):
         else:
             cuts.append(None)
 
-    # Per-image ghost count; collinear with primary, proportional shifts.
-    n_ghosts = random.choice(N_GHOSTS_CHOICES)
-    ghosts   = sample_collinear_ghosts(n_ghosts, img_w, img_h)
+    # Per-image ghost count; ghost size/alpha schedules and blur character are
+    # shared across the 3 bulbs, but each bulb-complex gets its own (sx, sy)
+    # shift drawn from [0, MAX] — different separations within one image.
+    n_ghosts        = random.choice(N_GHOSTS_CHOICES)
+    ghosts_per_bulb = sample_collinear_ghosts(n_ghosts, img_w, img_h, radii)
 
     # Rejection-sample bulb positions until all groups are well separated.
     xs = ys = None
@@ -324,7 +418,8 @@ def generate_one(idx, output_dir):
             x_hi = margin + (i + 1) * zone_w - zone_inner
             cand_xs.append(random.randint(x_lo, x_hi))
         cand_ys = [random.randint(margin, img_h - margin) for _ in range(3)]
-        if groups_well_separated(cand_xs, cand_ys, ghosts, min_group_dist):
+        if groups_well_separated(cand_xs, cand_ys, ghosts_per_bulb,
+                                 min_group_dist):
             xs, ys = cand_xs, cand_ys
             break
     if xs is None:
@@ -335,11 +430,18 @@ def generate_one(idx, output_dir):
             xs, ys, radii, intensities, pri_blurs, cuts, spike_configs):
         draw_bulb(primary_canvas, cx, cy, r, intens, pb, cut=cut, spikes=spk)
 
+    # Each bulb's ghosts are rendered with that bulb's own shift.
     ghost_rgb_total = np.zeros((img_h, img_w, 3), dtype=np.float32)
-    for g in ghosts:
-        ghost_rgb_total += make_ghost_layer(
-            primary_canvas, g["shift_x"], g["shift_y"], g["blur"], g["alpha"],
-        )
+    for b in range(3):
+        for g in ghosts_per_bulb[b]:
+            ghost_rgb_total += render_single_ghost_layer(
+                img_h, img_w,
+                xs[b], ys[b], radii[b], intensities[b], pri_blurs[b],
+                cuts[b], spike_configs[b],
+                size_scale=g["size"],
+                shift_x=g["shift_x"], shift_y=g["shift_y"],
+                blur_sigma=g["blur"], alpha=g["alpha"],
+            )
 
     canvas = np.clip(primary_canvas + ghost_rgb_total +
                      np.random.normal(0, 0.015, (img_h, img_w, 3)).astype(np.float32),
@@ -349,9 +451,13 @@ def generate_one(idx, output_dir):
     fname = f"bulbs_{idx:04d}.jpg"
     cv2.imwrite(os.path.join(output_dir, fname), img_u8)
 
-    points = sorted(zip(xs, ys, radii, cuts), key=lambda p: p[0])
+    # Pair each centroid with its own ghost list so consumers can read
+    # per-bulb shifts straight off the centroid record.  Sort everything by x
+    # so positional-rank matching (used by training/inference) lines up.
+    bundles = list(zip(xs, ys, radii, cuts, ghosts_per_bulb))
+    bundles.sort(key=lambda p: p[0])
     centroids = []
-    for x, y, r, cut in points:
+    for x, y, r, cut, bulb_ghosts in bundles:
         entry = {"x": float(x), "y": float(y), "radius": int(r)}
         if cut is None:
             entry["shape"] = "full"
@@ -361,6 +467,7 @@ def generate_one(idx, output_dir):
             entry["shape"] = "moon"
             entry["cut_angle"]  = float(cut[0])
             entry["cut_offset"] = float(cut[1])
+        entry["ghosts"] = bulb_ghosts
         centroids.append(entry)
 
     return {
@@ -370,7 +477,6 @@ def generate_one(idx, output_dir):
         "intensity": intensity,
         "centroids": centroids,
         "n_ghosts":  n_ghosts,
-        "ghosts":    ghosts,
     }
 
 
@@ -398,6 +504,12 @@ if __name__ == "__main__":
     ]
     for split, n, out_dir in splits:
         print(f"[{split}] generating {n} images → {out_dir}/")
+        # Invalidate any stale Stage-1 peak cache from a previous dataset —
+        # the new images will have different ghost geometry.
+        stale_cache = os.path.join(out_dir, "_blurred_peaks.npy")
+        if os.path.isfile(stale_cache):
+            os.remove(stale_cache)
+            print(f"  removed stale peak cache: {stale_cache}")
         args = [(idx, out_dir) for idx in range(n)]
 
         with Pool(processes=n_workers) as pool:
